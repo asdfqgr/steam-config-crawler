@@ -1,0 +1,105 @@
+name: Steam 配置采集
+
+# 手动触发为主；另设每月 1 号自动跑一次全量。
+# 老游戏配置几乎不更新，没必要跑太勤——每次全量约消耗 400~500 分钟额度。
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "每片最多采多少个（0 = 全部，调试用）"
+        required: false
+        default: "0"
+  schedule:
+    - cron: "0 18 1 * *" # 每月 1 日 UTC 18:00 = 北京时间 2 日 02:00
+
+permissions:
+  contents: write
+
+env:
+  SHARDS: 20
+  CONCURRENCY: 8
+
+jobs:
+  # 第一步：拿到全量 appid 列表（约 18.7 万个，8 分钟）
+  applist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 抓取游戏列表
+        run: python crawler/applist.py --out data/appids.jsonl --concurrency 8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appids
+          path: data/appids.jsonl
+          retention-days: 7
+
+  # 第二步：20 个分片并行采集。单片失败不影响其他片
+  crawl:
+    needs: applist
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: appids
+          path: data
+      - name: 采集分片 ${{ matrix.shard }}
+        continue-on-error: true
+        working-directory: crawler
+        run: |
+          python worker.py \
+            --ids ../data/appids.jsonl \
+            --out ../data/part-${{ matrix.shard }}.jsonl \
+            --shard ${{ matrix.shard }} \
+            --shards ${{ env.SHARDS }} \
+            --concurrency ${{ env.CONCURRENCY }} \
+            --limit ${{ github.event.inputs.limit || 0 }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-${{ matrix.shard }}
+          path: data/part-*.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+
+  # 第三步：合并成单一 SQLite，并打包成可下载产物
+  merge:
+    needs: crawl
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: data
+          merge-multiple: true
+      - name: 合并
+        run: python crawler/merge.py --parts data --out data/steam_games.db
+      - name: 打包（gzip 后体积约为原始的一半）
+        run: |
+          ls -lh data/steam_games.db
+          gzip -9 -c data/steam_games.db > data/steam_games.db.gz
+          ls -lh data/steam_games.db.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steam-db
+          path: |
+            data/steam_games.db.gz
+          retention-days: 30
