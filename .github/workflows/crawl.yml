@@ -16,14 +16,16 @@ permissions:
   contents: write
 
 env:
+  # 20 片 × 6 并发 = 80 个在途请求，实测不会触发 Steam 限流；
+  # 再高会明显增加 429 概率，反而更慢。
   SHARDS: 20
-  CONCURRENCY: 8
+  CONCURRENCY: 6
 
 jobs:
   # 第一步：拿到全量 appid 列表（约 18.7 万个，8 分钟）
   applist:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
