@@ -1,15 +1,16 @@
-"""抓取 Steam 全量游戏 appid 列表。
+"""抓取 Steam 游戏 appid 列表。
 
-两条路，优先走快的：
-  1. GetAppList v2 —— 一次请求返回全量（约 25 万条，含 DLC/软件），耗时几秒
-  2. 商店搜索分页  —— category1=998 只含游戏（约 18.7 万），但要 1870 次请求，慢
+三条路，按实测可用性排序（GitHub Actions 环境）：
+  1. SteamSpy 分页        实测 HTTP 200，1000 条/页，约 60-90 页就够，最快最稳
+  2. 商店搜索分页         搜索接口对 GitHub IP 大量 403，几乎不可用，仅作兜底
+  3. GetAppList v2        已废弃，返回 404
 
-实测 GetAppList 在海外节点稳定，所以在 GitHub Actions 上正常几秒就能完成；
-本机直连常被阻断，会自动回退到分页方式。
+SteamSpy 只收录「有人玩过」的游戏（约 6-9 万款），正好过滤掉大量空壳/DLC，
+对本工具是优点不是缺点——用户要查的本来就是有人在玩的游戏。
 
 用法:
-    python applist.py --out ../data/appids.jsonl --concurrency 8
-    python applist.py --no-v2        # 强制走分页
+    python applist.py --out ../data/appids.jsonl
+    python applist.py --source search     # 强制走搜索分页
 """
 
 from __future__ import annotations
@@ -20,13 +21,12 @@ import math
 import os
 import re
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-V2 = "https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+STEAMSPY = "https://steamspy.com/api.php?request=all&page={p}"
 SEARCH = (
     "https://store.steampowered.com/search/results/"
     "?start={start}&count={count}&infinite=1&json=1&l=schinese&category1=998"
@@ -37,146 +37,127 @@ UA = (
 )
 _APPID = re.compile(r'data-ds-appid="(\d+)"')
 
-# 名字里明确是附属内容/工具的，直接不要，省下几十万次详情请求
+# 名字里明确是附属内容/工具的，直接不要，省下大量详情请求
 _NOISE = re.compile(
-    r"(soundtrack|original soundtrack|ost\b|dedicated server|sdk\b|"
-    r"demo$|playtest|beta\b|dlc\b|season pass|artbook|art book|"
-    r"wallpaper|companion|benchmark)",
+    r"(soundtrack|original soundtrack|\bost\b|dedicated server|\bsdk\b|"
+    r"demo$|playtest|\bbeta\b|\bdlc\b|season pass|artbook|art book|"
+    r"wallpaper|companion|benchmark|test server)",
     re.I,
 )
 
-_lock = threading.Lock()
-_cons_fail = 0
-_pause_until = 0.0
 
-
-def _note_ok() -> None:
-    global _cons_fail
-    with _lock:
-        _cons_fail = 0
-
-
-def _note_fail(threshold: int = 6, pause: float = 30.0) -> None:
-    """连续失败达到阈值就全局暂停，避免把 IP 打爆。"""
-    global _cons_fail, _pause_until
-    with _lock:
-        _cons_fail += 1
-        if _cons_fail >= threshold:
-            _pause_until = time.time() + pause
-            _cons_fail = 0
-
-
-def _wait_if_paused() -> None:
-    while True:
-        with _lock:
-            remain = _pause_until - time.time()
-        if remain <= 0:
-            return
-        time.sleep(min(remain, 2.0))
-
-
-def _get(url: str, timeout: int = 25) -> bytes:
+def _get(url: str, timeout: int = 40) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
-def try_v2() -> list[int]:
-    """一次拿全量。失败返回空列表。"""
-    print("[1/2] 尝试 GetAppList v2（一次请求拿全量）...")
-    for attempt in range(3):
-        t0 = time.time()
+def by_steamspy() -> list[int]:
+    print("[1/2] SteamSpy 分页抓取 ...")
+    seen: dict[int, None] = {}
+    noise = 0
+    page = 0
+    empty = 0
+    t0 = time.time()
+    while page < 300:
         try:
-            data = json.loads(_get(V2, timeout=120))
-            apps = (data.get("applist") or {}).get("apps") or []
-            keep = []
-            noise = 0
-            for a in apps:
-                aid = a.get("appid")
-                name = (a.get("name") or "").strip()
-                if not aid or not name:
-                    continue
-                if _NOISE.search(name):
-                    noise += 1
-                    continue
-                keep.append(int(aid))
-            print(
-                "      返回 %d 条，过滤掉附属内容 %d 条，保留 %d 个（%.1fs）"
-                % (len(apps), noise, len(keep), time.time() - t0)
-            )
-            if len(keep) >= 50000:
-                return sorted(set(keep))
-            print("      条数异常偏少，回退到分页方式", file=sys.stderr)
-            return []
+            d = json.loads(_get(STEAMSPY.format(p=page)))
+        except urllib.error.HTTPError as exc:
+            print("  page %d HTTP %d，作为结尾处理" % (page, exc.code))
+            empty += 1
+            if empty >= 2:
+                break
+            page += 1
+            time.sleep(2)
+            continue
         except Exception as exc:  # noqa: BLE001
-            print("      第 %d 次失败：%s" % (attempt + 1, str(exc)[:80]), file=sys.stderr)
-            time.sleep(3 * (attempt + 1))
-    return []
-
-
-def fetch_page(start: int, count: int, retries: int = 3) -> tuple[int, list[int], int]:
-    """返回 (start, appid 列表, 总游戏数)。失败返回空列表。"""
-    _wait_if_paused()
-    for attempt in range(retries):
-        try:
-            raw = _get(SEARCH.format(start=start, count=count))
-            data = json.loads(raw)
-            ids = [int(x) for x in _APPID.findall(data.get("results_html", ""))]
-            _note_ok()
-            return start, ids, int(data.get("total_count") or 0)
-        except Exception as exc:  # noqa: BLE001
-            if attempt == retries - 1:
-                _note_fail()
-                print("  page start=%d 失败: %s" % (start, str(exc)[:60]), file=sys.stderr)
-            else:
-                time.sleep(1.5 * (attempt + 1))
-    return start, [], 0
+            print("  page %d 失败 %s" % (page, str(exc)[:50]))
+            empty += 1
+            if empty >= 3:
+                break
+            page += 1
+            time.sleep(3)
+            continue
+        if not d:
+            print("  page %d 空页，结束" % page)
+            break
+        empty = 0
+        for k, v in d.items():
+            try:
+                aid = int(k)
+            except Exception:  # noqa: BLE001
+                continue
+            if _NOISE.search((v or {}).get("name") or ""):
+                noise += 1
+                continue
+            seen[aid] = None
+        if page % 10 == 0:
+            print("  page %3d  累计 %6d 个  %.0fs" % (page, len(seen), time.time() - t0), flush=True)
+        page += 1
+        time.sleep(0.4)
+    print("      共 %d 页，收 %d 个，过滤附属内容 %d 个（%.0fs）"
+          % (page, len(seen), noise, time.time() - t0))
+    return sorted(seen)
 
 
 def by_search(concurrency: int, count: int) -> list[int]:
     print("[1/2] 探测游戏总数 ...")
-    _, _, total = fetch_page(0, count)
+    total = 0
+    for attempt in range(4):
+        try:
+            d = json.loads(_get(SEARCH.format(start=0, count=count), timeout=25))
+            total = int(d.get("total_count") or 0)
+            break
+        except Exception as exc:  # noqa: BLE001
+            print("  探测失败 %s，重试" % str(exc)[:50])
+            time.sleep(5 * (attempt + 1))
     if not total:
-        print("错误：探测总数失败，网络可能不通", file=sys.stderr)
         return []
     pages = math.ceil(total / count)
-    print("      总数 %d，共 %d 页" % (total, pages))
+    print("      总数 %d，共 %d 页（搜索接口易 403，会比较慢）" % (total, pages))
 
-    print("[2/2] 并发 %d 抓取分页 ..." % concurrency)
     seen: dict[int, None] = {}
-    empty_streak = 0
     t0 = time.time()
+
+    def page_at(s: int) -> list[int]:
+        for attempt in range(6):
+            try:
+                d = json.loads(_get(SEARCH.format(start=s, count=count), timeout=25))
+                return [int(x) for x in _APPID.findall(d.get("results_html", ""))]
+            except urllib.error.HTTPError as exc:
+                if exc.code in (403, 429):
+                    time.sleep(20 * (attempt + 1))
+                else:
+                    return []
+            except Exception:  # noqa: BLE001
+                time.sleep(5 * (attempt + 1))
+        return []
+
+    print("[2/2] 抓取分页 ...")
     with ThreadPoolExecutor(concurrency) as ex:
-        futs = [ex.submit(fetch_page, s * count, count) for s in range(pages)]
+        futs = [ex.submit(page_at, s * count) for s in range(pages)]
         for i, fut in enumerate(as_completed(futs), 1):
-            _, ids, _ = fut.result()
-            for x in ids:
+            for x in fut.result():
                 seen[x] = None
-            empty_streak = empty_streak + 1 if not ids else 0
             if i % 100 == 0:
-                print(
-                    "      %d/%d 页  已收 %d 个  用时 %.0fs"
-                    % (i, pages, len(seen), time.time() - t0),
-                    flush=True,
-                )
-            if empty_streak >= 25:
-                print("      连续 25 页为空，提前停止（可能被限流）", file=sys.stderr)
-                break
+                print("      %d/%d 页  已收 %d 个  %.0fs"
+                      % (i, pages, len(seen), time.time() - t0), flush=True)
     return sorted(seen)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="../data/appids.jsonl")
-    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--source", default="steamspy", choices=["steamspy", "search"])
+    ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--count", type=int, default=100)
-    ap.add_argument("--no-v2", action="store_true", help="强制走搜索分页")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
-    ids = [] if args.no_v2 else try_v2()
+    ids = by_steamspy() if args.source == "steamspy" else by_search(args.concurrency, args.count)
     if not ids:
+        print("SteamSpy 失败，回退到搜索分页", file=sys.stderr)
         ids = by_search(args.concurrency, args.count)
     if not ids:
         print("错误：拿不到任何 appid", file=sys.stderr)
