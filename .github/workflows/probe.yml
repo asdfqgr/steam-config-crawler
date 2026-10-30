@@ -1,0 +1,17 @@
+name: Steam 接口探测
+
+# 一次性排查用：确认哪些接口在 GitHub 环境下可用、哪些会被 429。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 探测
+        run: python crawler/probe.py
