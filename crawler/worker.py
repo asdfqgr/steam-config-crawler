@@ -171,8 +171,11 @@ def main() -> int:
     with open(args.ids, "r", encoding="utf-8") as f:
         all_ids = [int(x) for x in f.read().split() if x.strip()]
     mine = [a for i, a in enumerate(all_ids) if i % args.shards == args.shard]
-    if args.limit:
-        mine = mine[: args.limit]
+    if args.limit and len(mine) > args.limit:
+        # 等距抽样而不是取前 N 个：appid 是升序的，取前 N 会全是上古小 ID，
+        # 抽样才能覆盖老游戏和新游戏，验证结果才有代表性。
+        step = len(mine) / float(args.limit)
+        mine = [mine[int(i * step)] for i in range(args.limit)]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     outdir = os.path.dirname(os.path.abspath(args.out))
