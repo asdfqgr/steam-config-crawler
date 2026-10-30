@@ -1,7 +1,10 @@
 name: Steam 配置采集
 
-# 手动触发为主；另设每月 1 号自动跑一次全量。
-# 老游戏配置几乎不更新，没必要跑太勤——每次全量约消耗 400~500 分钟额度。
+# 手动触发为主；另设每月 1 号自动跑一次。
+#
+# 实测限制（2026-10-30，GitHub Actions 环境）：
+#   appdetails 单 IP 突发配额约 200-240 个请求，之后 429，约 5 分钟恢复
+#   → 可持续 2400 请求/小时/IP。分片跑在不同机器上，各有各的配额。
 on:
   workflow_dispatch:
     inputs:
@@ -13,37 +16,40 @@ on:
     - cron: "0 18 1 * *" # 每月 1 日 UTC 18:00 = 北京时间 2 日 02:00
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  # 20 片 × 6 并发 = 80 个在途请求，实测不会触发 Steam 限流；
-  # 再高会明显增加 429 概率，反而更慢。
+  # 20 片是 GitHub 免费账户的并发上限，正好用满。
   SHARDS: 20
-  CONCURRENCY: 6
+  # 并发只是让请求排满；真正决定速率的是令牌桶，这里不宜太大。
+  CONCURRENCY: 4
+  STEAM_RATE: "0.5"
 
 jobs:
-  # 第一步：拿到全量 appid 列表（约 18.7 万个，8 分钟）
+  # 第一步：拿 appid 列表（SteamSpy 分页，约 60-90 次请求，一两分钟）
   applist:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: 抓取游戏列表
-        run: python crawler/applist.py --out data/appids.jsonl --concurrency 8
+        run: python crawler/applist.py --out data/appids.jsonl
+      - name: 数量统计
+        run: wc -l data/appids.jsonl
       - uses: actions/upload-artifact@v4
         with:
           name: appids
           path: data/appids.jsonl
-          retention-days: 7
+          retention-days: 30
 
   # 第二步：20 个分片并行采集。单片失败不影响其他片
   crawl:
     needs: applist
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -61,6 +67,8 @@ jobs:
       - name: 采集分片 ${{ matrix.shard }}
         continue-on-error: true
         working-directory: crawler
+        env:
+          STEAM_RATE: ${{ env.STEAM_RATE }}
         run: |
           python worker.py \
             --ids ../data/appids.jsonl \
@@ -73,11 +81,13 @@ jobs:
         if: always()
         with:
           name: part-${{ matrix.shard }}
-          path: data/part-*.jsonl
+          path: |
+            data/part-*.jsonl
+            data/skip-*.jsonl
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30
 
-  # 第三步：合并成单一 SQLite，并打包成可下载产物
+  # 第三步：合并成单一 SQLite，打包成可下载产物
   merge:
     needs: crawl
     runs-on: ubuntu-latest
@@ -102,6 +112,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: steam-db
-          path: |
-            data/steam_games.db.gz
+          path: data/steam_games.db.gz
           retention-days: 30
