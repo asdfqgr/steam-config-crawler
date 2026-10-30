@@ -1,8 +1,13 @@
 name: Steam 接口探测
 
-# 一次性排查用：确认哪些接口在 GitHub 环境下可用、哪些会被 429。
+# 一次性排查用：确认哪些接口在 GitHub 环境下可用、哪些会被 429/403。
 on:
   workflow_dispatch:
+    inputs:
+      script:
+        description: "要跑的探测脚本（probe / probe2）"
+        required: false
+        default: "probe2"
 
 jobs:
   probe:
@@ -14,4 +19,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: 探测
-        run: python crawler/probe.py
+        run: python crawler/${{ github.event.inputs.script || 'probe2' }}.py
