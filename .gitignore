@@ -1,0 +1,7 @@
+# 采集产物，不进版本库（跑完 workflow 从 artifact 下载）
+data/*.jsonl
+data/*.db
+data/*.db.gz
+data/*.gz
+__pycache__/
+*.pyc
